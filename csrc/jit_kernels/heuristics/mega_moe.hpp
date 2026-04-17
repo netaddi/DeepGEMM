@@ -99,20 +99,45 @@ static int get_num_experts_per_wave_for_mega_moe(
     return num_experts_per_wave;
 }
 
-static int get_num_l1_only_sms_for_mega_moe(const int& num_sms) {
-    // Optimization knob: when > 0, partition SMs by phase. SMs [0, N) only execute L1,
-    // SMs [N, num_sms) only execute L2. They overlap via l2_arrival_mask, removing
-    // L1<->L2 transition stalls. Both halves must be even (cluster invariant).
+static int get_num_l1_only_sms_for_mega_moe(
+    const int& num_sms, const int& intermediate_hidden, const int& block_k) {
+    // Phase-split partitions SMs into L1-only / L2-only groups; they overlap through
+    // the existing l2_arrival_mask, removing the L1<->L2 transition stall.
     //
-    // Default off (0). For Qwen3.5-style shapes (small intermediate_hidden), setting
-    // DG_MEGA_L1_ONLY_SMS=num_sms/2 measured +16-31% on GB200.
-    const int env_l1 = get_env<int>("DG_MEGA_L1_ONLY_SMS", 0);
-    if (env_l1 <= 0)
+    // DG_MEGA_L1_ONLY_SMS:
+    //   unset / -1  → auto (enable for short L2 K, disable otherwise)
+    //         0     → force off
+    //         N>0   → force this many L1-only SMs (must be even and < num_sms,
+    //                 with num_sms - N also even)
+    const int env_l1 = get_env<int>("DG_MEGA_L1_ONLY_SMS", -1);
+    if (env_l1 == 0)
         return 0;
-    DG_HOST_ASSERT(env_l1 % 2 == 0);
-    DG_HOST_ASSERT(env_l1 < num_sms);
-    DG_HOST_ASSERT((num_sms - env_l1) % 2 == 0);
-    return env_l1;
+    if (env_l1 > 0) {
+        DG_HOST_ASSERT(env_l1 % 2 == 0);
+        DG_HOST_ASSERT(env_l1 < num_sms);
+        DG_HOST_ASSERT((num_sms - env_l1) % 2 == 0);
+        return env_l1;
+    }
+
+    // Auto: enable phase-split only when L2 K-iter count is small enough that the
+    // MMA pipeline starves on the L1<->L2 transition.
+    //
+    // Measured on GB200 (152 SMs):
+    //   Qwen3.5  (intermediate=1024, L2 K-iter=8):  +16~31% with N = num_sms/2
+    //   GLM5     (intermediate=2048, L2 K-iter=16): -17% (longer K saturates pipeline)
+    //   DeepSeek (intermediate=3072, L2 K-iter=24): -18%
+    //
+    // Threshold of 8 K-iters captures Qwen3.5 and excludes GLM5/DeepSeek.
+    constexpr int kPhaseSplitMaxL2KIters = 8;
+    const int l2_k_iters = intermediate_hidden / block_k;
+    if (l2_k_iters > kPhaseSplitMaxL2KIters)
+        return 0;
+
+    // Round num_sms/2 down to the nearest even (both halves must be even).
+    const int half = (num_sms / 2) & ~1;
+    if (half == 0 or (num_sms - half) == 0 or (num_sms - half) % 2 != 0)
+        return 0;
+    return half;
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe(
@@ -192,7 +217,7 @@ static MegaMoEConfig get_mega_moe_config(
     const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms);
-    const int num_l1_only_sms = get_num_l1_only_sms_for_mega_moe(num_sms);
+    const int num_l1_only_sms = get_num_l1_only_sms_for_mega_moe(num_sms, intermediate_hidden, block_k);
 
     // Thread layout
     const int num_dispatch_threads = 128;
