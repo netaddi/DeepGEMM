@@ -24,7 +24,10 @@ static dtype_t get_env(const std::string& name, const dtype_t& default_value = d
     if constexpr (std::is_same_v<dtype_t, std::string>) {
         return std::string(c_str);
     } else if constexpr (std::is_same_v<dtype_t, int>) {
-        int value;
+        // Empty string → return default (avoid uninitialized sscanf result)
+        if (c_str[0] == '\0')
+            return default_value;
+        int value = 0;
         std::sscanf(c_str, "%d", &value);
         return value;
     } else {

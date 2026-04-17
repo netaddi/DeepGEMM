@@ -50,8 +50,8 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
             ptx::red_add_rel_sys(sym_buffer.map(signal_ptr, thread_idx), signal_sign ? -1 : 1);
         sync_scope();
 
-        // Update status and wait arrival (with 30s timeout, at 2 GHz)
-        constexpr int64_t kNumTimeoutCycles = 30ll * 2000000000ll;
+        // Update status and wait arrival (1800s timeout — bumped from 30s to allow ncu profiling)
+        constexpr int64_t kNumTimeoutCycles = 1800ll * 2000000000ll;
         if (thread_idx == 0) {
             ptx::red_add(counter_ptr, 1);
             const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);

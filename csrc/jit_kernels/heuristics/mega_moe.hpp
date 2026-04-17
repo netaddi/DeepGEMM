@@ -31,6 +31,12 @@ struct MegaMoEConfig {
     // Number of experts to process per wave
     int num_experts_per_wave;
 
+    // Phase specialization: when > 0, the first `num_l1_only_sms` SMs only execute L1
+    // and the rest only execute L2. They overlap through the existing l2_arrival_mask
+    // (L2-only SMs consume pool blocks as L1-only SMs produce them), removing the
+    // L1<->L2 transition stall on every SM.
+    int num_l1_only_sms;
+
     // Pipeline stages and shared memory
     int num_stages, smem_size;
 
@@ -47,6 +53,7 @@ struct MegaMoEConfig {
            << ", num_padded_sf_pool_tokens=" << config.num_padded_sf_pool_tokens
            << ", swizzle_acts_mode=" << config.swizzle_acts_mode << ", swizzle_weights_mode=" << config.swizzle_weights_mode
            << ", num_experts_per_wave=" << config.num_experts_per_wave
+           << ", num_l1_only_sms=" << config.num_l1_only_sms
            << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
@@ -90,6 +97,22 @@ static int get_num_experts_per_wave_for_mega_moe(
         ++ num_experts_per_wave;
 
     return num_experts_per_wave;
+}
+
+static int get_num_l1_only_sms_for_mega_moe(const int& num_sms) {
+    // Optimization knob: when > 0, partition SMs by phase. SMs [0, N) only execute L1,
+    // SMs [N, num_sms) only execute L2. They overlap via l2_arrival_mask, removing
+    // L1<->L2 transition stalls. Both halves must be even (cluster invariant).
+    //
+    // Default off (0). For Qwen3.5-style shapes (small intermediate_hidden), setting
+    // DG_MEGA_L1_ONLY_SMS=num_sms/2 measured +16-31% on GB200.
+    const int env_l1 = get_env<int>("DG_MEGA_L1_ONLY_SMS", 0);
+    if (env_l1 <= 0)
+        return 0;
+    DG_HOST_ASSERT(env_l1 % 2 == 0);
+    DG_HOST_ASSERT(env_l1 < num_sms);
+    DG_HOST_ASSERT((num_sms - env_l1) % 2 == 0);
+    return env_l1;
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe(
@@ -169,6 +192,7 @@ static MegaMoEConfig get_mega_moe_config(
     const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms);
+    const int num_l1_only_sms = get_num_l1_only_sms_for_mega_moe(num_sms);
 
     // Thread layout
     const int num_dispatch_threads = 128;
@@ -190,6 +214,7 @@ static MegaMoEConfig get_mega_moe_config(
         num_max_pool_tokens, num_padded_sf_pool_tokens,
         swizzle_acts_mode, swizzle_weights_mode,
         num_experts_per_wave,
+        num_l1_only_sms,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads
     };

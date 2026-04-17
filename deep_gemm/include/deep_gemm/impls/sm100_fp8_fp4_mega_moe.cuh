@@ -23,6 +23,7 @@ template <
     uint32_t kHidden, uint32_t kIntermediateHidden,
     uint32_t kNumExperts, uint32_t kNumTopk,
     uint32_t kNumExpertsPerWave,
+    uint32_t kNumL1OnlySMs,
     uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
     uint32_t STORE_BLOCK_M,
     uint32_t SF_BLOCK_M, uint32_t SF_BLOCK_N,
@@ -316,7 +317,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank,
         kNumExpertsPerWave,
-        kNumSMs, kNumRanks>(workspace);
+        kNumSMs, kNumRanks,
+        kNumL1OnlySMs>(workspace);
 
     // MMA pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;

@@ -22,12 +22,20 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumExpertsPerRank,
           uint32_t kNumExpertsPerWave,
           uint32_t kNumSMs, uint32_t kNumRanks,
+          uint32_t kNumL1OnlySMs = 0,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
           uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K,
-          uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K>
+          uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K,
+          uint32_t kNumL2OnlySMs = (kNumL1OnlySMs > 0) ? (kNumSMs - kNumL1OnlySMs) : 0>
 struct MegaMoEScheduler {
+    // When true, SMs [0, kNumL1OnlySMs) execute only L1 blocks and SMs
+    // [kNumL1OnlySMs, kNumSMs) execute only L2 blocks. They overlap through the
+    // existing l2_arrival_mask so an L2-only SM consumes a pool block as soon as
+    // the L1-only SMs have produced it, removing the L1<->L2 transition stall.
+    static constexpr bool kPhaseSpecialized = (kNumL1OnlySMs > 0);
+
     DG_STATIC_ASSERT(L1_SHAPE_N % BLOCK_N == 0, "Invalid shape");
     DG_STATIC_ASSERT(L2_SHAPE_N % BLOCK_N == 0, "Invalid shape");
     DG_STATIC_ASSERT(L1_SHAPE_K % BLOCK_K == 0, "Invalid shape");
@@ -39,6 +47,12 @@ struct MegaMoEScheduler {
     DG_STATIC_ASSERT(kNumSMs % 2 == 0, "Number of SMs must be even for 2-CTA cluster");
     DG_STATIC_ASSERT(kNumL1BlockNs % 2 == 0, "L1 N block count must be even for 2-CTA cluster");
     DG_STATIC_ASSERT(kNumL2BlockNs % 2 == 0, "L2 N block count must be even for 2-CTA cluster");
+
+    // Phase specialization preserves the cluster invariant only when both halves are even.
+    DG_STATIC_ASSERT(not kPhaseSpecialized or (kNumL1OnlySMs % 2 == 0),
+                     "L1-only SM count must be even for 2-CTA cluster");
+    DG_STATIC_ASSERT(not kPhaseSpecialized or (kNumL2OnlySMs % 2 == 0 and kNumL2OnlySMs > 0),
+                     "L2-only SM count must be even and positive for 2-CTA cluster");
 
     // Arrival counts
     const layout::Workspace& workspace;
@@ -54,12 +68,27 @@ struct MegaMoEScheduler {
     uint32_t m_block_idx = 0;
     uint32_t n_block_idx = 0;
 
+    // Phase-specialized state: which phase this SM owns and the per-wave reset position.
+    // Unused when kPhaseSpecialized is false.
+    bool is_l1_only = false;
+    uint32_t my_initial_block_idx = 0;
+    uint32_t my_stride = kNumSMs;
+
     // Pre-cached per-expert token counts (filled during `for_each_block` init)
     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
 
     CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::Workspace& workspace): workspace(workspace) {
-        block_idx = blockIdx.x;
+        if constexpr (kPhaseSpecialized) {
+            // SMs [0, kNumL1OnlySMs) only do L1; the rest only do L2. Cluster pairs stay together
+            // because kNumL1OnlySMs is even, so block 2k and 2k+1 land in the same phase group.
+            is_l1_only = blockIdx.x < kNumL1OnlySMs;
+            my_initial_block_idx = is_l1_only ? blockIdx.x : (blockIdx.x - kNumL1OnlySMs);
+            my_stride = is_l1_only ? kNumL1OnlySMs : kNumL2OnlySMs;
+            block_idx = my_initial_block_idx;
+        } else {
+            block_idx = blockIdx.x;
+        }
     }
 
     CUTLASS_DEVICE uint32_t get_wave_expert_end_idx() const {
@@ -146,38 +175,63 @@ struct MegaMoEScheduler {
 
     // Core state machine: assigns the next block
     CUTLASS_DEVICE cute::tuple<BlockPhase, uint32_t, uint32_t, uint32_t> get_next_block() {
-        while (true) {
-            if (current_local_expert_idx >= kNumExpertsPerRank)
-                break;
-
-            if (next_phase == BlockPhase::Linear1) {
-                if (fetch_next_l1_block()) {
-                    // Found a new L1 block
-                    n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
-                    // Jump to next block
-                    block_idx += kNumSMs;
-                    return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx, n_block_idx};
+        if constexpr (kPhaseSpecialized) {
+            // L1-only SM walks only L1 phases; L2-only SM walks only L2 phases.
+            // Across waves, block_idx is reset to this SM's initial position so each
+            // wave is distributed evenly within its phase group.
+            while (current_local_expert_idx < kNumExpertsPerRank) {
+                if (is_l1_only) {
+                    if (fetch_next_l1_block()) {
+                        n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
+                        block_idx += my_stride;
+                        return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx, n_block_idx};
+                    }
                 } else {
-                    // L1 for the current wave is complete, transition to L2
-                    next_phase = BlockPhase::Linear2;
-                    set_expert_idx(math::align<uint32_t, false>(current_local_expert_idx - 1, kNumExpertsPerWave));
+                    if (fetch_next_l2_block()) {
+                        n_block_idx = block_idx - m_block_idx * kNumL2BlockNs;
+                        block_idx += my_stride;
+                        return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx, n_block_idx};
+                    }
                 }
-            } else {
-                if (fetch_next_l2_block()) {
-                    // Found a new L2 block
-                    n_block_idx = block_idx - m_block_idx * kNumL2BlockNs;
-                    // Jump to next block
-                    block_idx += kNumSMs;
-                    return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx, n_block_idx};
+                // Current wave is fully assigned. `current_local_expert_idx` was advanced
+                // past the wave end by the fetch loop. Reset block_idx for the next wave.
+                block_idx = my_initial_block_idx;
+            }
+            return {BlockPhase::None, 0, 0, 0};
+        } else {
+            while (true) {
+                if (current_local_expert_idx >= kNumExpertsPerRank)
+                    break;
+
+                if (next_phase == BlockPhase::Linear1) {
+                    if (fetch_next_l1_block()) {
+                        // Found a new L1 block
+                        n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
+                        // Jump to next block
+                        block_idx += kNumSMs;
+                        return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx, n_block_idx};
+                    } else {
+                        // L1 for the current wave is complete, transition to L2
+                        next_phase = BlockPhase::Linear2;
+                        set_expert_idx(math::align<uint32_t, false>(current_local_expert_idx - 1, kNumExpertsPerWave));
+                    }
                 } else {
-                    // Move to L1 of the next wave
-                    next_phase = BlockPhase::Linear1;
+                    if (fetch_next_l2_block()) {
+                        // Found a new L2 block
+                        n_block_idx = block_idx - m_block_idx * kNumL2BlockNs;
+                        // Jump to next block
+                        block_idx += kNumSMs;
+                        return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx, n_block_idx};
+                    } else {
+                        // Move to L1 of the next wave
+                        next_phase = BlockPhase::Linear1;
+                    }
                 }
             }
-        }
 
-        // All waves and experts are fully processed
-        return {BlockPhase::None, 0, 0, 0};
+            // All waves and experts are fully processed
+            return {BlockPhase::None, 0, 0, 0};
+        }
     }
 
     CUTLASS_DEVICE void fetch_expert_recv_count() {
