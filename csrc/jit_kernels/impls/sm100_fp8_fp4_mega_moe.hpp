@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstring>
 #include <torch/python.h>
 
 #include "../../jit/compiler.hpp"
@@ -48,6 +49,8 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+        uint32_t activation_clamp_bits;
+        std::memcpy(&activation_clamp_bits, &args.activation_clamp, sizeof(uint32_t));
         return fmt::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 
@@ -83,7 +86,7 @@ static void __instantiate_kernel() {{
     args.config.num_stages,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
-    to_string(args.activation_clamp),
+    activation_clamp_bits,
     args.fast_math ? "true" : "false");
     }
 
