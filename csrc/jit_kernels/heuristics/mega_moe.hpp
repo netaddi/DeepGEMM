@@ -65,7 +65,7 @@ struct MegaMoEConfig {
 static int get_block_m_for_mega_moe(const int& num_ranks, const int& num_experts,
                                     const int& num_max_tokens_per_rank, const int& num_topk) {
     // TODO: compute based on configs
-    return 192;
+    return get_env<int>("DG_MEGA_BLOCK_M", 192);
 }
 
 static int get_num_experts_per_wave_for_mega_moe(
@@ -203,7 +203,7 @@ static MegaMoEConfig get_mega_moe_config(
     const int block_k = 128;
     const int load_block_m = block_m / 2;
     const int load_block_n = block_n;
-    const int store_block_m = 32;
+    const int store_block_m = get_env<int>("DG_MEGA_STORE_BLOCK_M", 32);
     const auto [sf_block_m, sf_block_n] = SM100ArchSpec::get_sf_uttcp_aligned_block_sizes(block_m, block_n, MmaKind::MXFP8FP4);
     const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
         num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank, block_m);
