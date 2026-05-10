@@ -8,6 +8,7 @@
 #include "../../utils/format.hpp"
 #include "runtime_utils.hpp"
 
+#include <cstring>
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 
@@ -17,6 +18,12 @@ namespace deep_gemm {
 
 class SM100FP8FP4MegaMoERuntime final : public LaunchRuntime<SM100FP8FP4MegaMoERuntime> {
 public:
+    static uint32_t float_to_bits(const float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    }
+
     struct Args {
         // Templated arguments
         int num_max_tokens_per_rank;
@@ -84,7 +91,7 @@ static void __instantiate_kernel() {{
     args.config.num_stages,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
-    to_string(args.activation_clamp),
+    fmt::format("0x{:08x}u", float_to_bits(args.activation_clamp)),
     args.fast_math ? "true" : "false");
     }
 

@@ -32,7 +32,7 @@ template <
     uint32_t kNumDispatchThreads, uint32_t kNumNonEpilogueThreads,
     uint32_t kNumEpilogueThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
-    float kActivationClamp,
+    uint32_t kActivationClampBits,
     bool kFastMath,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -1002,10 +1002,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             auto bf16_up = __float22bfloat162_rn(make_float2(fp32_values[k * 4 + 2], fp32_values[k * 4 + 3]));
 
                             // Clamp
-                            if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
-                                bf16_gate = __hmin2(bf16_gate, {kActivationClamp, kActivationClamp});
-                                bf16_up = __hmax2(bf16_up, {-kActivationClamp, -kActivationClamp});
-                                bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
+                            if constexpr (kActivationClampBits != 0x7f800000u) {
+                                const float activation_clamp = __uint_as_float(kActivationClampBits);
+                                bf16_gate = __hmin2(bf16_gate, {activation_clamp, activation_clamp});
+                                bf16_up = __hmax2(bf16_up, {-activation_clamp, -activation_clamp});
+                                bf16_up = __hmin2(bf16_up, {activation_clamp, activation_clamp});
                             }
 
                             // SwiGLU
